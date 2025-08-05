@@ -152,9 +152,6 @@ class HTTPClient:
             elif method == "tools/list":
                 result = await self.session.list_tools()
                 result = result.model_dump(exclude_none=True)
-                # result = {
-                #     "tools": [tool.model_dump(exclude_none=True) for tool in tools.tools]
-                # }
             elif method == "tools/call":
                 result = await self.session.call_tool(name=params["name"], arguments=params["arguments"])
                 result = result.model_dump(exclude_none=True)

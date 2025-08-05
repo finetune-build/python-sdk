@@ -8,10 +8,6 @@ from finetune.config import Config
 
 try:
     from rich import print as rprint
-    from rich.panel import Panel
-    from rich.table import Table
-    from rich.live import Live
-    from rich.console import Console
 except ImportError:
     rprint("❌ [red]rich is required[/red]")
     sys.exit(1)
@@ -29,7 +25,6 @@ except ImportError:
     sys.exit(1)
 
 from finetune.cli import console, ConfigOption, VerboseOption
-
 
 def register_start(app):
     @app.command()
