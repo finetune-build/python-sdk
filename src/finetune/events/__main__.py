@@ -1,5 +1,6 @@
 import aiohttp
 import asyncio
+import ssl
 import json
 
 from finetune.api.worker import worker_pong
@@ -9,6 +10,8 @@ from finetune.ws.worker import worker_start_websocket_thread
 
 from finetune.utils.redis_client import RedisClient
 from finetune.api.worker import worker_mcp_response
+
+from finetune.events.streamable_http import async_stream_client
 
 class EventListener:
     def __init__(self, redis_client: RedisClient = None):
@@ -72,6 +75,7 @@ class EventListener:
         """
         Handle JSON-RPC 2.0 formatted requests.
         """
+        print(data)
         method = data.get("method")
         params = data.get("params", {})
         request_id = data.get("id")
@@ -84,6 +88,10 @@ class EventListener:
                 "result": "pong",
                 "id": request_id,
             }
+
+        elif method == "mcp_connect":
+            print("called mcp connect...")
+            await async_stream_client(params["initialization_id"])
     
         elif method == "worker_mcp_request":
             print("Received worker MCP request event")
