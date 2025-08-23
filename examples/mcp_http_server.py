@@ -6,9 +6,8 @@ from mcp.types import Completion, ResourceTemplateReference, PromptReference
 mcp = FastMCP(name="SimpleServer", stateless_http=True)
 
 # Completion
-# https://github.com/modelcontextprotocol/modelcontextprotocol/discussions/122
 @mcp.completion()
-async def handle_completion(ref, argument, context):
+async def handle_completion(ref: PromptReference | ResourceTemplateReference | None, argument, context):
     if isinstance(ref, ResourceTemplateReference):
         return Completion(values=["user1", "user2"])
     if isinstance(ref, PromptReference):
@@ -56,8 +55,8 @@ def echo(message: str) -> str:
 @mcp.tool(description="Add two numbers")
 def add(a: int, b: int) -> int:
     """Add two numbers together"""
-    print(a + b)
-    return a + b
+    print(f"Adding {a} + {b}")
+    result = a + b
+    print(f"Result: {result}")
+    return result
 
-def create_app():
-    mcp.run(transport="streamable-http")

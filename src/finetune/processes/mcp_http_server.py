@@ -1,118 +1,433 @@
-# mcp_http_server_process.py
 import asyncio
+import httpx
 import importlib.util
+import json
 import sys
-from pathlib import Path
-from typing import Any, Optional
+import ssl
+import traceback
 import uvicorn
-from finetune.processes.base import BaseProcess
 
+from mcp.server.fastmcp import FastMCP
+from pathlib import Path
+from starlette.applications import Starlette
+from typing import Any, cast
+from typing_extensions import override
+from uuid import uuid4, UUID
+
+from finetune.conf import settings
+from finetune.processes.base import BaseProcess
 
 class MCPHttpServerProcess(BaseProcess):
     """Simplified process manager for MCP HTTP servers."""
     
     def __init__(
         self,
-        # server_file: str = "server.py",
         server_file: str = "examples/mcp_http_server.py",
         host: str = "127.0.0.1",
-        port: int = 8000,
+        port: int = 8001,
         reload: bool = False,
         *args,
         **kwargs
     ):
         super().__init__(*args, **kwargs)
-        self.server_file = server_file
-        self.host = host
-        self.port = port
-        self.reload = reload
+        self.server_file: str = server_file
+        self.host: str = host
+        self.port: int = port
+        self.reload: bool = reload
         self._server = None
+        self.relay_id: UUID | None = uuid4()
+        self.app: Starlette | None = None
         
-    def load_server_app(self):
+    def load_server_app(self, module_name:str = "mcp"):
         """Load the ASGI app from the server file."""
-        server_path = Path(self.server_file).resolve()
-        
-        if not server_path.exists():
-            # Try looking in examples directory as fallback
-            examples_path = Path("examples") / self.server_file
-            if examples_path.exists():
-                server_path = examples_path.resolve()
-            else:
-                raise FileNotFoundError(
-                    f"Server file not found: {self.server_file}\n"
-                    f"Create a server.py file with your MCP server implementation."
-                )
-        
-        self.logger.info(f"Loading server from: {server_path}")
-        
-        # Load module from file
-        spec = importlib.util.spec_from_file_location("user_mcp_server", server_path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules["user_mcp_server"] = module
-        spec.loader.exec_module(module)
-        
-        # For simple FastMCP servers (like our examples)
-        if hasattr(module, 'mcp'):
-            mcp = module.mcp
-            # Check if it's already an app or needs conversion
-            if hasattr(mcp, 'streamable_http_app'):
+        try:
+            server_path = Path(self.server_file).resolve()
+            
+            if not server_path.exists():
+                examples_path = Path("examples") / Path(self.server_file).name
+                if examples_path.exists():
+                    server_path = examples_path.resolve()
+                else:
+                    raise FileNotFoundError(f"Server file not found: {self.server_file}")
+            
+            self.logger.info(f"Loading server from: {server_path}")
+            
+            # Load module from file
+            spec = importlib.util.spec_from_file_location("user_mcp_server", server_path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Could not load spec for {server_path}")
+                
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["user_mcp_server"] = module
+            spec.loader.exec_module(module)
+            
+            # Try different ways to get the app
+            app: Starlette | None = None
+
+            if hasattr(module, module_name):
+                mcp = cast(FastMCP, getattr(module, module_name))
                 self.logger.info("Found FastMCP server, creating ASGI app")
-                return mcp.streamable_http_app()
-        
-        # For FastAPI/Starlette apps
-        if hasattr(module, 'app'):
-            self.logger.info("Found ASGI app directly")
-            return module.app
-        
-        raise AttributeError(
-            f"No MCP server or ASGI app found in {self.server_file}. "
-            "Expected either:\n"
-            "  - A FastMCP instance named 'mcp'\n"
-            "  - A FastAPI/Starlette app named 'app'"
-        )
+                app = mcp.streamable_http_app()
+            
+            if app is None:
+                # List what we found for debugging
+                attributes = [attr for attr in dir(module) if not attr.startswith('_')]
+                self.logger.error(f"Module attributes: {attributes}")
+                
+                raise AttributeError(f"No ASGI app found in {self.server_file}. Expected 'mcp' with streamable_http_app() method")
+            return app
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load server app: {e}")
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
     
     async def run_server(self):
-        """Run the HTTP server."""
-        while self.running:
-            try:
-                app = self.load_server_app()
-                
-                self.logger.info(f"Starting MCP server on {self.host}:{self.port}")
+        """Run the HTTP server and maintain proxy connection."""
+        try:
+            self.logger.info("Starting MCP HTTP Server Process...")
+            
+            # Load the ASGI app first
+            self.logger.info("Loading ASGI app...")
+            self.app = self.load_server_app()
+            self.logger.info(f"ASGI app loaded successfully: {type(self.app)}")
+            
+            # Start local server in background
+            self.logger.info("Starting local server task...")
+            local_server_task = asyncio.create_task(self.run_local_server())
+            
+            # Give the local server a moment to start
+            await asyncio.sleep(2)
+            
+            # Start proxy connection
+            self.logger.info("Starting proxy connection...")
+            proxy_task = asyncio.create_task(self.maintain_proxy_connection())
+            
+            # Wait for either task to complete (or fail)
+            done, pending = await asyncio.wait(
+                [local_server_task, proxy_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            # Cancel pending tasks
+            for task in pending:
+                _ = task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            
+            # Check if any task failed
+            for task in done:
+                if task.exception():
+                    self.logger.error(f"Task failed: {task.exception()}")
+                    # raise task.exception()
+                    
+        except Exception as e:
+            self.logger.error(f"Server error: {e}")
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
+
+    async def run_local_server(self):
+        """Run the local HTTP server for development/testing."""
+        try:
+            if self.app is not None:
+                self.logger.info(f"Starting local MCP server on {self.host}:{self.port}")
                 
                 config = uvicorn.Config(
-                    app,
+                    self.app,
                     host=self.host,
                     port=self.port,
                     reload=self.reload,
                     log_level="info",
-                    access_log=False,
+                    access_log=True,  # Enable access log for debugging
                 )
                 
                 self._server = uvicorn.Server(config)
                 await self._server.serve()
+            
+        except Exception as e:
+            self.logger.error(f"Local server error: {e}")
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
+
+    async def maintain_proxy_connection(self):
+        """Maintain connection to Django proxy using simple HTTP."""
+        headers = {
+            "X-Worker-ID": settings.WORKER_ID,
+            "X-Relay-ID": str(self.relay_id),
+        }
+    
+        while self.running:
+            try:
+                self.logger.info("Attempting proxy connection...")
                 
-                if self.running:
-                    self.logger.warning("Server stopped unexpectedly")
-                    await asyncio.sleep(5)  # Simple retry delay
+                import httpx
                 
+                async with httpx.AsyncClient(verify=False, headers=headers, timeout=None) as client:
+                    self.logger.info(f"Connecting to Django proxy")
+                    
+                    async with client.stream(
+                        "GET",
+                        f"https://{settings.DJANGO_HOST}/v1/worker/{settings.WORKER_ID}/streamable_http/"
+                    ) as response:
+                        self.logger.info(f"Connected to proxy: {response.status_code}")
+                        
+                        if response.status_code != 200:
+                            self.logger.error(f"Failed to connect to proxy: {response.status_code}")
+                            await asyncio.sleep(5)
+                            continue
+                        
+                        self.logger.info("Starting to listen for messages...")
+                        
+                        # Process Server-Sent Events
+                        buffer = ""
+                        chunk_count = 0
+                        
+                        try:
+                            async for chunk in response.aiter_text():
+                                chunk_count += 1
+                                
+                                if not chunk:
+                                    continue
+                                
+                                buffer += chunk
+                                
+                                # Process complete SSE messages
+                                while "\n\n" in buffer:
+                                    message, buffer = buffer.split("\n\n", 1)
+                                    
+                                    # Parse SSE format
+                                    if message.startswith("data: "):
+                                        data = message[6:]  # Remove "data: " prefix
+                                        if data.strip() and data.strip() != "[DONE]":
+                                            self.logger.info(f"Received SSE message: {data[:100]}...")
+                                            await self.handle_message(data)
+                                        
+                        except Exception as stream_error:
+                            self.logger.error(f"Error in stream processing: {stream_error}")
+                            break
+                    
             except asyncio.CancelledError:
-                self.logger.info("Server cancelled")
+                self.logger.info("Proxy connection cancelled")
                 break
             except Exception as e:
-                self.logger.error(f"Server error: {e}")
+                self.logger.error(f"Proxy connection error: {e}")
+                self.logger.error(f"Traceback: {traceback.format_exc()}")
                 if self.running:
-                    self.logger.info("Retrying in 5 seconds...")
+                    self.logger.info("Retrying proxy connection in 5 seconds...")
                     await asyncio.sleep(5)
-        
-        self.logger.info("Server stopped")
-    
+
+    async def handle_message(self, message: str):
+        """Handle a message received from the inspector via the proxy."""
+        try:
+            # Parse the message (assuming it's JSON)
+            data = json.loads(message)
+            
+            method = data.get('method', 'unknown')
+            self.logger.info(f"Processing inspector message type: {method}")
+            
+            # Forward to local MCP server
+            response = await self.forward_to_local_server(data)
+            
+            # Check if this is a notification
+            if method.startswith('notifications/'):
+                self.logger.info(f"Notification {method} processed")
+                # For notifications, DON'T send anything back through the queue
+                # The inspector will handle the acknowledgment directly
+                if response and response.get('error'):
+                    self.logger.warning(f"Notification processing error: {response}")
+                else:
+                    self.logger.debug(f"Notification processed successfully")
+                # Don't send anything to the queue for notifications
+            else:
+                # For regular requests, send the full response back to inspector
+                await self.send_response(response)
+            
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Failed to parse message as JSON: {e}")
+            self.logger.error(f"Raw message: {repr(message)}")
+            # Only send error responses for non-notifications
+            if not data.get('method', '').startswith('notifications/'):
+                await self.send_response({"error": f"Invalid JSON: {e}"})
+        except Exception as e:
+            self.logger.error(f"Error handling inspector message: {e}")
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            # Only send error responses for non-notifications
+            if not data.get('method', '').startswith('notifications/'):
+                await self.send_response({"error": str(e)})
+
+    async def forward_to_local_server(self, data):
+        """Forward the request to the local MCP server."""
+        try:
+            # FastMCP in stateless HTTP mode expects the endpoint with trailing slash
+            url = f"http://{self.host}:{self.port}/mcp/"
+            
+            # FastMCP stateless HTTP mode requires BOTH Accept headers
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream, application/json",  # BOTH are required!
+            }
+            
+            self.logger.info(f"Forwarding to local server: {url}")
+            self.logger.debug(f"Request headers: {headers}")
+            self.logger.debug(f"Request data: {json.dumps(data)[:200]}...")
+            
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                response = await client.post(
+                    url,
+                    json=data,
+                    headers=headers,
+                    timeout=30.0
+                )
+                
+                self.logger.info(f"Local server response: {response.status_code}")
+                self.logger.debug(f"Response Content-Type: {response.headers.get('content-type')}")
+                
+                # Handle successful responses (2xx status codes)
+                if 200 <= response.status_code < 300:
+                    content_type = response.headers.get('content-type', '')
+                    
+                    # For 202 Accepted (notifications), there might be no body or a simple acknowledgment
+                    if response.status_code == 202:
+                        self.logger.info("Received 202 Accepted (notification acknowledged)")
+                        # Check if there's any response body
+                        if response.text:
+                            try:
+                                # Try to parse as JSON
+                                return response.json()
+                            except:
+                                # If not JSON, return a simple acknowledgment
+                                return {"status": "accepted", "code": 202}
+                        else:
+                            # No body, return acknowledgment
+                            return {"status": "accepted", "code": 202}
+                    
+                    # For 204 No Content, return an empty success
+                    elif response.status_code == 204:
+                        self.logger.info("Received 204 No Content")
+                        return {"status": "success", "code": 204}
+                    
+                    # Handle 200 OK with content
+                    elif response.status_code == 200:
+                        # Handle SSE (Server-Sent Events) response
+                        if 'text/event-stream' in content_type:
+                            self.logger.info("Received SSE response, parsing...")
+                            
+                            # Parse SSE format
+                            response_text = response.text
+                            result = None
+                            
+                            for line in response_text.split('\n'):
+                                if line.startswith('data: '):
+                                    json_data = line[6:]  # Remove 'data: ' prefix
+                                    if json_data.strip():
+                                        try:
+                                            result = json.loads(json_data)
+                                            self.logger.debug(f"Parsed SSE data: {json.dumps(result)[:200]}...")
+                                            break
+                                        except json.JSONDecodeError as e:
+                                            self.logger.warning(f"Failed to parse SSE line: {e}")
+                            
+                            if result:
+                                return result
+                            else:
+                                self.logger.error(f"No valid JSON found in SSE response: {response_text[:500]}")
+                                return {"error": "Failed to parse SSE response"}
+                        
+                        # Handle regular JSON response
+                        elif 'application/json' in content_type:
+                            try:
+                                result = response.json()
+                                self.logger.debug(f"Response: {json.dumps(result)[:200]}...")
+                                return result
+                            except Exception as e:
+                                self.logger.error(f"Failed to parse JSON response: {e}")
+                                self.logger.error(f"Response text: {response.text}")
+                                return {"error": f"Invalid JSON response: {e}"}
+                        
+                        else:
+                            self.logger.warning(f"Unexpected content type: {content_type}")
+                            # Try to parse as JSON anyway
+                            try:
+                                result = response.json()
+                                return result
+                            except:
+                                # Try to parse as SSE
+                                for line in response.text.split('\n'):
+                                    if line.startswith('data: '):
+                                        try:
+                                            return json.loads(line[6:])
+                                        except:
+                                            pass
+                                # If no valid format found but status is 200, return success
+                                if not response.text:
+                                    return {"status": "success", "code": 200}
+                                return {"error": f"Unknown response format: {response.text[:200]}"}
+                    
+                    # Handle other 2xx status codes
+                    else:
+                        self.logger.info(f"Received {response.status_code} response")
+                        if response.text:
+                            try:
+                                return response.json()
+                            except:
+                                return {"status": "success", "code": response.status_code, "body": response.text}
+                        else:
+                            return {"status": "success", "code": response.status_code}
+                
+                elif response.status_code == 406:
+                    error_msg = f"HTTP 406: {response.text}"
+                    self.logger.error(error_msg)
+                    return {"error": error_msg}
+                
+                else:
+                    error_msg = f"HTTP {response.status_code}: {response.text[:500]}"
+                    self.logger.error(error_msg)
+                    return {"error": error_msg}
+
+        except Exception as e:
+            self.logger.error(f"Unexpected error: {e}")
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            return {"error": str(e)}
+
+    async def send_response(self, data: object):
+        """Send response back to proxy."""
+        try:
+            headers = {
+                "X-Worker-ID": settings.WORKER_ID,
+                "X-Relay-ID": str(self.relay_id),
+                "Content-Type": "application/json"
+            }
+            
+            content = json.dumps(data)
+            
+            async with httpx.AsyncClient(verify=False) as client:
+                result = await client.post(
+                    f"https://{settings.DJANGO_HOST}/v1/worker/{settings.WORKER_ID}/streamable_http/",
+                    content=content,
+                    headers=headers
+                )
+                
+            self.logger.info(f"Sent response to inspector: {result.status_code}")
+            
+        except Exception as e:
+            self.logger.error(f"Error sending response to inspector: {e}")
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
+ 
+    @override
     def run(self):
         """Main process loop."""
         try:
             asyncio.run(self.run_server())
+        except KeyboardInterrupt:
+            self.logger.info("Process interrupted by user")
         except Exception as e:
             self.logger.error(f"Process error: {e}")
-    
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            # Don't re-raise here to prevent restart loop
+
+    @override
     def _shutdown(self, signum: int, frame: Any):
         """Handle shutdown signals."""
         self.logger.info(f"Received signal {signum}, shutting down...")
@@ -121,35 +436,9 @@ class MCPHttpServerProcess(BaseProcess):
         if self._server:
             self._server.should_exit = True
 
-
 def main():
-    """CLI entry point."""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="MCP HTTP Server Process")
-    parser.add_argument(
-        "server_file",
-        nargs="?",
-        # default="server.py",
-        default = "examples/mcp_http_server.py",
-        help="Server file to run (default: server.py)"
-    )
-    parser.add_argument("--host", default="127.0.0.1", help="Host to bind to")
-    parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
-    parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
-    parser.add_argument("--name", default="mcp-server", help="Process name")
-    
-    args = parser.parse_args()
-    
-    process = MCPHttpServerProcess(
-        server_file=args.server_file,
-        host=args.host,
-        port=args.port,
-        reload=args.reload,
-        name=args.name
-    )
+    process = MCPHttpServerProcess()
     process.start()
-
 
 if __name__ == "__main__":
     main()

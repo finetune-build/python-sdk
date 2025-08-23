@@ -45,9 +45,6 @@ events = [
 [project.scripts]
 finetune = "finetune.cli:app [cli]"
 
-[tool.hatch.version]
-path = "src/finetune/__init__.py"
-
 [tool.black]
 line-length = 88
 target-version = ["py310"]
