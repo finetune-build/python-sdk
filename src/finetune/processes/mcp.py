@@ -14,10 +14,11 @@ from typing import Any, cast
 from typing_extensions import override
 from uuid import uuid4, UUID
 
+from finetune.api.worker import worker_relay
 from finetune.conf import settings
 from finetune.processes.base import BaseProcess
 
-class MCPHttpServerProcess(BaseProcess):
+class MCPProcess(BaseProcess):
     """Simplified process manager for MCP HTTP servers."""
     
     def __init__(
@@ -34,11 +35,10 @@ class MCPHttpServerProcess(BaseProcess):
         self.host: str = host
         self.port: int = port
         self.reload: bool = reload
-        self._server = None
         self.relay_id: UUID | None = uuid4()
         self.app: Starlette | None = None
         
-    def load_server_app(self, module_name:str = "mcp"):
+    def load_server_app(self, module_name:str = "mcp") -> Starlette:
         """Load the ASGI app from the server file."""
         try:
             server_path = Path(self.server_file).resolve()
@@ -83,130 +83,60 @@ class MCPHttpServerProcess(BaseProcess):
             raise
     
     async def run_server(self):
-        """Run the HTTP server and maintain proxy connection."""
+        """Run the local Uvicorn server and maintain proxy connection together."""
         try:
-            self.logger.info("Starting MCP HTTP Server Process...")
-            
-            # Load the ASGI app first
             self.logger.info("Loading ASGI app...")
             self.app = self.load_server_app()
             self.logger.info(f"ASGI app loaded successfully: {type(self.app)}")
-            
-            # Start local server in background
-            self.logger.info("Starting local server task...")
-            local_server_task = asyncio.create_task(self.run_local_server())
-            
-            # Give the local server a moment to start
-            await asyncio.sleep(2)
-            
-            # Start proxy connection
+    
+            # Start local Uvicorn server in background
+            self.logger.info(f"Starting local MCP server on {self.host}:{self.port}")
+            config = uvicorn.Config(
+                self.app,
+                host=self.host,
+                port=self.port,
+                reload=self.reload,
+                log_level="info",
+                access_log=True,
+            )
+            server = uvicorn.Server(config)
+            local_server_task = asyncio.create_task(server.serve())
+    
+            # Start proxy connection in background
             self.logger.info("Starting proxy connection...")
-            proxy_task = asyncio.create_task(self.maintain_proxy_connection())
-            
-            # Wait for either task to complete (or fail)
+            proxy_task = asyncio.create_task(self.relay())
+    
+            # Wait until either task fails or completes
             done, pending = await asyncio.wait(
                 [local_server_task, proxy_task],
-                return_when=asyncio.FIRST_COMPLETED
+                return_when=asyncio.FIRST_EXCEPTION
             )
-            
-            # Cancel pending tasks
+    
+            # Cancel remaining tasks
             for task in pending:
                 _ = task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
-                    pass
-            
-            # Check if any task failed
+                    self.logger.info(f"Cancelled task: {task}")
+    
+            # Raise exception if any task failed
             for task in done:
                 if task.exception():
-                    self.logger.error(f"Task failed: {task.exception()}")
-                    # raise task.exception()
-                    
+                    raise task.exception()
+    
         except Exception as e:
             self.logger.error(f"Server error: {e}")
-            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            self.logger.error(traceback.format_exc())
             raise
 
-    async def run_local_server(self):
-        """Run the local HTTP server for development/testing."""
-        try:
-            if self.app is not None:
-                self.logger.info(f"Starting local MCP server on {self.host}:{self.port}")
-                
-                config = uvicorn.Config(
-                    self.app,
-                    host=self.host,
-                    port=self.port,
-                    reload=self.reload,
-                    log_level="info",
-                    access_log=True,  # Enable access log for debugging
-                )
-                
-                self._server = uvicorn.Server(config)
-                await self._server.serve()
-            
-        except Exception as e:
-            self.logger.error(f"Local server error: {e}")
-            self.logger.error(f"Traceback: {traceback.format_exc()}")
-            raise
-
-    async def maintain_proxy_connection(self):
-        """Maintain connection to Django proxy using simple HTTP."""
-        headers = {
-            "X-Worker-ID": settings.WORKER_ID,
-            "X-Relay-ID": str(self.relay_id),
-        }
+    async def relay(self):
+        """Maintain relay between API and MCP servers"""
     
         while self.running:
             try:
                 self.logger.info("Attempting proxy connection...")
-                
-                import httpx
-                
-                async with httpx.AsyncClient(verify=False, headers=headers, timeout=None) as client:
-                    self.logger.info(f"Connecting to Django proxy")
-                    
-                    async with client.stream(
-                        "GET",
-                        f"https://{settings.DJANGO_HOST}/v1/worker/{settings.WORKER_ID}/streamable_http/"
-                    ) as response:
-                        self.logger.info(f"Connected to proxy: {response.status_code}")
-                        
-                        if response.status_code != 200:
-                            self.logger.error(f"Failed to connect to proxy: {response.status_code}")
-                            await asyncio.sleep(5)
-                            continue
-                        
-                        self.logger.info("Starting to listen for messages...")
-                        
-                        # Process Server-Sent Events
-                        buffer = ""
-                        chunk_count = 0
-                        
-                        try:
-                            async for chunk in response.aiter_text():
-                                chunk_count += 1
-                                
-                                if not chunk:
-                                    continue
-                                
-                                buffer += chunk
-                                
-                                # Process complete SSE messages
-                                while "\n\n" in buffer:
-                                    message, buffer = buffer.split("\n\n", 1)
-                                    
-                                    # Parse SSE format
-                                    if message.startswith("data: "):
-                                        data = message[6:]  # Remove "data: " prefix
-                                        if data.strip() and data.strip() != "[DONE]":
-                                            self.logger.info(f"Received SSE message: {data[:100]}...")
-                                            await self.handle_message(data)
-                                        
-                        except Exception as stream_error:
-                            self.logger.error(f"Error in stream processing: {stream_error}")
-                            break
+                await worker_relay(self.relay_id, self.handle_message)
                     
             except asyncio.CancelledError:
                 self.logger.info("Proxy connection cancelled")
@@ -222,9 +152,9 @@ class MCPHttpServerProcess(BaseProcess):
         """Handle a message received from the inspector via the proxy."""
         try:
             # Parse the message (assuming it's JSON)
-            data = json.loads(message)
+            data = cast(dict[str, Any], json.loads(message))
             
-            method = data.get('method', 'unknown')
+            method = cast(str, data.get('method', 'unknown'))
             self.logger.info(f"Processing inspector message type: {method}")
             
             # Forward to local MCP server
@@ -404,7 +334,7 @@ class MCPHttpServerProcess(BaseProcess):
             
             async with httpx.AsyncClient(verify=False) as client:
                 result = await client.post(
-                    f"https://{settings.DJANGO_HOST}/v1/worker/{settings.WORKER_ID}/streamable_http/",
+                    f"https://{settings.DJANGO_HOST}/v1/worker/{settings.WORKER_ID}/relay/",
                     content=content,
                     headers=headers
                 )
@@ -432,12 +362,9 @@ class MCPHttpServerProcess(BaseProcess):
         """Handle shutdown signals."""
         self.logger.info(f"Received signal {signum}, shutting down...")
         self.running = False
-        
-        if self._server:
-            self._server.should_exit = True
 
 def main():
-    process = MCPHttpServerProcess()
+    process = MCPProcess()
     process.start()
 
 if __name__ == "__main__":

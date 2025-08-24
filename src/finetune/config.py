@@ -1,5 +1,4 @@
 from pathlib import Path
-from typing import Dict, Optional
 
 from pydantic import BaseModel, Field
 
@@ -9,19 +8,19 @@ class RedisConfig(BaseModel):
     host: str = "localhost"
     port: int = 6379
     db: int = 0
-    password: Optional[str] = None
+    password: str | None = None
 
 
 class ProcessConfig(BaseModel):
     """Individual process configuration."""
     command: str
-    directory: Optional[str] = None
+    directory: str | None = None
     autostart: bool = True
     autorestart: bool = True
-    user: Optional[str] = None
-    environment: Dict[str, str] = Field(default_factory=dict)
-    stdout_logfile: Optional[str] = None
-    stderr_logfile: Optional[str] = None
+    user: str | None = None
+    environment: dict[str, str] = Field(default_factory=dict)
+    stdout_logfile: str | None = None
+    stderr_logfile: str | None = None
 
 
 class SupervisorConfig(BaseModel):
@@ -38,7 +37,7 @@ class Config(BaseModel):
     """Main application configuration."""
     redis: RedisConfig = Field(default_factory=RedisConfig)  # Re-enabled Redis
     supervisor: SupervisorConfig = Field(default_factory=SupervisorConfig)
-    processes: Dict[str, ProcessConfig] = Field(default_factory=dict)
+    processes: dict[str, ProcessConfig] = Field(default_factory=dict)
     app_name: str = "finetune"
     log_dir: str = "/tmp/finetune"
     
@@ -73,7 +72,7 @@ class Config(BaseModel):
                 stderr_dir.mkdir(parents=True, exist_ok=True)
     
     @classmethod
-    def load(cls, config_path: Optional[Path] = None) -> "Config":
+    def load(cls, config_path: str | None = None) -> "Config":
         """Load configuration from file."""
         if config_path and config_path.exists():
             # In a real implementation, you'd load from YAML/TOML/JSON
@@ -85,7 +84,7 @@ class Config(BaseModel):
         instance.create_directories()
         return instance
     
-    def get_process_configs(self) -> Dict[str, ProcessConfig]:
+    def get_process_configs(self) -> dict[str, ProcessConfig]:
         """Get default process configurations."""
         if not self.processes:
             # Default processes
@@ -97,41 +96,11 @@ class Config(BaseModel):
                     stdout_logfile=f"{self.log_dir}/events.out.log",
                     stderr_logfile=f"{self.log_dir}/events.err.log",
                 ),
-                # "client": ProcessConfig(
-                #     command=f"{python_path}.client",
-                #     stdout_logfile=f"{self.log_dir}/client.out.log",
-                #     stderr_logfile=f"{self.log_dir}/client.err.log",
-                # ),
-                # "mcp_client": ProcessConfig(
-                #     command=f"{python_path}.mcp_client",
-                #     stdout_logfile=f"{self.log_dir}/mcp_client.out.log",
-                #     stderr_logfile=f"{self.log_dir}/mcp_client.err.log",
-                # ),
-                # "server": ProcessConfig(
-                #     command=f"{python_path}.server",
-                #     stdout_logfile=f"{self.log_dir}/server.out.log",
-                #     stderr_logfile=f"{self.log_dir}/server.err.log",
-                # ),
-                # "mcp_server": ProcessConfig(
-                #     command=f"{python_path}.mcp_server",
-                #     stdout_logfile=f"{self.log_dir}/mcp_server.out.log",
-                #     stderr_logfile=f"{self.log_dir}/mcp_server.err.log",
-                # ),
-
-                "mcp_http_client": ProcessConfig(
+                "mcp": ProcessConfig(
                     # Changed: Now runs mcp_http module which looks for server.py by default
-                    command=f"{python_path}.mcp_http_client",
-                    stdout_logfile=f"{self.log_dir}/mcp_http_client.out.log",
-                    stderr_logfile=f"{self.log_dir}/mcp_http_client.err.log",
-                    # Optional: Pass working directory to help find server.py
-                    directory=".",
-                ),
-
-                "mcp_http_server": ProcessConfig(
-                    # Changed: Now runs mcp_http module which looks for server.py by default
-                    command=f"{python_path}.mcp_http_server",
-                    stdout_logfile=f"{self.log_dir}/mcp_http_server.out.log",
-                    stderr_logfile=f"{self.log_dir}/mcp_http_server.err.log",
+                    command=f"{python_path}.mcp",
+                    stdout_logfile=f"{self.log_dir}/mcp.out.log",
+                    stderr_logfile=f"{self.log_dir}/mcp.err.log",
                     # Optional: Pass working directory to help find server.py
                     directory=".",
                 ),

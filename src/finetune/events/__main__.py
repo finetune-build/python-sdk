@@ -22,7 +22,7 @@ class EventListener:
         self.headers = {
             "Authorization": f"Access {settings.ACCESS_TOKEN}",
             "X-Worker-ID": settings.WORKER_ID,
-            "X-Session-ID": str(settings.SESSION_UUID),
+            # "X-Session-ID": str(settings.SESSION_UUID),
             "X-Client-Role": "machine",
         }
     

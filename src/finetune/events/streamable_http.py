@@ -1,10 +1,10 @@
 import asyncio
 import ssl
 import aiohttp
+
 from uuid import uuid4
 
-DOMAIN = "developmentpackage.finetune.engineering"
-STREAM_PATH = "/v1/worker/3qssEZ8hV7tSPAMumoYhLu/streamable_http/"
+from finetune.conf import settings
 
 async def async_stream_client(initialization_id: str):
     print("Starting worker stream client...")
@@ -23,8 +23,8 @@ async def async_stream_client(initialization_id: str):
     
     # Send GET request to establish streaming connection
     request = (
-        "GET /v1/worker/3qssEZ8hV7tSPAMumoYhLu/streamable_http/ HTTP/1.1\r\n"
-        "Host: developmentpackage.finetune.engineering\r\n"
+        f"GET /v1/worker/{settings.WORKER_ID}/relay/ HTTP/1.1\r\n"
+        # "Host: developmentpackage.finetune.engineering\r\n"
         "Connection: keep-alive\r\n"
         "Accept: text/event-stream\r\n"
         f"Initialization-Id: {initialization_id}\r\n"
@@ -70,7 +70,7 @@ async def send_message(mcp_session_id: str, message: str):
     async with aiohttp.ClientSession() as session:
         try:
             async with session.post(
-                f"https://{DOMAIN}{STREAM_PATH}",
+                f"https://{settings.DJANGO_HOST}/v1/worker/{settings.WORKER_ID}/relay/",
                 data=message,
                 headers={
                     "Content-Type": "text/plain",
@@ -85,9 +85,3 @@ async def send_message(mcp_session_id: str, message: str):
         except Exception as e:
             print(f"[Worker] Error sending message: {e}")
 
-# Run the client
-if __name__ == "__main__":
-    # You'll need to get the initialization_id from somewhere
-    # (e.g., passed as an argument or from the worker task)
-    initialization_id = "YOUR_INITIALIZATION_ID_HERE"
-    asyncio.run(async_stream_client(initialization_id))
