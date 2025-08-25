@@ -5,7 +5,10 @@ from uuid import UUID
 from finetune.conf import settings
 from finetune.api.utils import request
 
-async def worker_relay(relay_id: UUID, handle_message):
+async def get_worker_relay(relay_id: UUID):
+    """
+    Connects to the worker relay and yields SSE message data chunks as they arrive.
+    """
     url = f"https://{settings.DJANGO_HOST}/v1/worker/{settings.WORKER_ID}/relay/"
     headers = {
         "X-Worker-ID": settings.WORKER_ID,
@@ -17,7 +20,7 @@ async def worker_relay(relay_id: UUID, handle_message):
             async with session.get(url, ssl=False, timeout=None) as response:
                 if response.status != 200:
                     print(f"Failed to connect to proxy: {response.status}")
-                    return  # Exit; caller can handle reconnect
+                    return  # Generator will just end
 
                 buffer = ""
                 async for chunk_bytes in response.content.iter_any():
@@ -30,13 +33,38 @@ async def worker_relay(relay_id: UUID, handle_message):
                     # Process complete SSE messages
                     while "\n\n" in buffer:
                         message, buffer = buffer.split("\n\n", 1)
+                        print(f"message: {message}")
                         if message.startswith("data: "):
                             data = message[6:]  # Remove "data: " prefix
                             if data.strip() and data.strip() != "[DONE]":
-                                await handle_message(data)
+                                yield data  # 🚀 yield instead of handle_message
 
         except Exception as stream_error:
             print(f"Error in stream processing: {stream_error}")
+            return
+
+async def post_worker_relay(relay_id: UUID, mcp_session_id: str | None, body_bytes: bytes):
+    url = f"https://{settings.DJANGO_HOST}/v1/worker/{settings.WORKER_ID}/relay/"
+
+    headers = {
+        "X-Worker-ID": settings.WORKER_ID,
+        "X-Relay-ID": str(relay_id),
+        "Content-Type": "application/octet-stream"
+    }
+
+    if mcp_session_id is not None: 
+        headers["Mcp-Session-Id"] = mcp_session_id
+
+    async with aiohttp.ClientSession(headers=headers) as session:
+        try:
+            async with session.post(url, data=body_bytes, ssl=False) as response:
+                if response.status != 204:
+                    print(f"Failed to post worker relay: {response.status}")
+                else:
+                    print(f"Posted successfully: {await response.text()}")
+
+        except Exception as e:
+            print(f"Error post worker relay: {e}")
 
 
 async def worker_pong():
